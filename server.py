@@ -43,6 +43,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 import api
 import lan
+import realtime
 from echo_guard import EchoGuard
 from engine import DEFAULT_SYSTEM_PROMPT, Fragmenter, GpuKeepAwake, Talker, Thinker, log
 from tools import FILLERS, Toolbox
@@ -387,6 +388,8 @@ app = FastAPI(lifespan=lifespan, title="Ming Voice", version="1.8.0",
                           "under `/v1`. From other devices (LAN port) send `Authorization: Bearer <access key>`.")
 api.setup(ENGINE, GPU_TURN, VOICES, TOOLBOX)
 app.include_router(api.router)
+realtime.setup(ENGINE, GPU_TURN, VOICES, TOOLBOX)
+app.include_router(realtime.router)
 app.add_middleware(lan.AccessControl)
 
 

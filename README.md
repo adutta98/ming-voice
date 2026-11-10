@@ -365,6 +365,7 @@ The same server speaks the OpenAI API; interactive docs are at <http://localhost
 | `POST /v1/audio/transcriptions` | Speech to text (multipart `file`), any length, English or Chinese |
 | `POST /v1/chat/completions` | Chat with text and/or audio input (`input_audio` parts) and optional spoken output (`"modalities": ["text", "audio"]`); `stream: true` streams text and pcm16 audio. Greedy decoding. OpenAI function calling isn't supported, but `"ming": {"tools": true}` lets the reply use Ming's own tools (and `"room": "Kitchen"` sets the Home Assistant area) |
 | `GET /v1/models` | `ming-3.0-audio-tiny` |
+| `WS /v1/realtime` | Direct voice conversation over the OpenAI Realtime protocol (see below) |
 
 ```bash
 curl http://localhost:8000/v1/audio/speech -H "Content-Type: application/json" \
@@ -383,6 +384,43 @@ From another device, use `https://<pc-ip>:8443/v1` with `api_key=<contents of .l
 self-signed certificate (`curl -k`, or pass `certs/lan.crt` as the CA). API requests share the GPU with the
 voice session; chat requests run on an isolated copy of the conversation state, so they never disturb a live
 conversation.
+
+### Realtime voice calls
+
+`/v1/realtime` speaks the OpenAI Realtime protocol over a single WebSocket: you send 16 kHz mono pcm16
+(base64, `input_audio_buffer.append`) and Ming answers with 24 kHz pcm16 (`response.audio.delta`) — the
+whole conversation on one connection, no separate STT and TTS legs, with server-side VAD (Silero, plus the
+smart-turn model when it is configured), barge-in, and the assistant's own voice filtered out by the echo
+guard. It holds the same conversation state as the main app: a realtime connection takes the session over
+(like a second browser tab) and the conversation persists to the same file.
+
+```python
+import asyncio, base64, json
+import numpy as np
+import websockets  # pip install websockets
+
+async def main():
+    async with websockets.connect("ws://localhost:8000/v1/realtime") as ws:
+        json.loads(await ws.recv())  # session.created
+        # stream your 16 kHz mic, 32 ms frames, base64-encoded
+        while True:
+            frame = np.zeros(512, np.float32)  # your mic here
+            await ws.send(json.dumps({"type": "input_audio_buffer.append",
+                                      "audio": base64.b64encode(
+                                          (frame * 32767).astype("<i2").tobytes()).decode()}))
+            msg = json.loads(await ws.recv())
+            if msg["type"] == "response.audio.delta":
+                pcm16 = base64.b64decode(msg["delta"])  # 24 kHz — play it
+
+asyncio.run(main())
+```
+
+Clients that already implement OpenAI Realtime work as-is: Open WebUI's **OpenAI Realtime** engine (point
+its base URL at `http://<pc>:8000/v1/realtime`, any API key on localhost), or the OpenAI Python SDK with a
+rewritten WebSocket base URL. `session.update` accepts `voice`, `instructions`, `temperature`,
+`max_output_tokens` and `turn_detection` (`null` for client-side VAD with explicit
+`input_audio_buffer.commit`). Ming runs its own tools (web search, weather, Home Assistant, …) whenever
+they are configured; the reply is spoken with the selected voice.
 
 ## Settings and configuration
 
