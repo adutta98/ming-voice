@@ -117,7 +117,11 @@ class RealtimeSession:
         }
 
         # VAD / turn state (mirrors server.Session, minus wake word and undo/resume)
-        self.vad = E["engine"]["vad_proto"]()  # one Silero instance per session, like the main app
+        vad_proto = E["engine"].get("vad_proto")
+        if vad_proto is None:  # belt and braces: the route only runs once ready, but never KeyError
+            from silero_vad import load_silero_vad
+            vad_proto = load_silero_vad
+        self.vad = vad_proto()  # one Silero instance per session, like the main app
         self.in_speech = False
         self.frames: list[np.ndarray] = []
         self.preroll: list[np.ndarray] = []
@@ -579,18 +583,41 @@ class RealtimeSession:
             self.response = None
 
 
+async def _take_over(old):
+    """Tell the session we replace that it is being replaced, then close it - on a short leash.
+    The old client may be suspended (a mobile tab) and never drain our write, so a stuck send must
+    not block the connection that replaces it (fire-and-forget, 3 s cap)."""
+    try:
+        await asyncio.wait_for(old.ws.send_text(json.dumps({"type": "taken_over", "by": "realtime"})), timeout=3)
+    except Exception:
+        pass
+    try:
+        old.close()
+    except Exception:
+        pass
+
+
 @router.websocket("/realtime")
 async def realtime(ws: WebSocket, model: str = ""):
     from server import ACTIVE
     await ws.accept()
+    if not E.get("engine", {}).get("ready"):
+        # model still loading (right after a restart / image update): the ENGINE dict is only fully
+        # populated at the end of boot, and building a session against it would crash (KeyError).
+        # Reject cleanly - OpenAI-realtime clients retry on close code 1013 (Try Again Later).
+        log("realtime: connection refused - model still loading")
+        try:
+            await ws.send_text(json.dumps({"type": "error",
+                                           "error": {"type": "api_error", "code": "model_not_ready",
+                                                     "message": "the model is still loading - try again shortly"}}))
+        except Exception:
+            pass
+        await ws.close(code=1013)
+        return
     sess = RealtimeSession(ws, asyncio.get_running_loop(), model=model)
     old = ACTIVE.get("sess")
     if old is not None and old is not sess:
-        try:
-            await old.ws.send_text(json.dumps({"type": "taken_over", "by": "realtime"}))
-            old.close()
-        except Exception:
-            pass
+        asyncio.ensure_future(_take_over(old))  # never awaited here: see _take_over
     ACTIVE["sess"] = sess
     try:
         await sess.run()
