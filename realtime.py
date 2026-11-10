@@ -53,11 +53,11 @@ def _oid(kind: str) -> str:
 
 
 def _voice_for(name: str | None, voices: list[str]) -> str:
-    if name in voices:
+    if name is not None and name in voices:
         return name
-    if name in E["engine"].get("custom_voices", {}):
+    if name is not None and name in E["engine"].get("custom_voices", {}):
         return name  # a cloned voice: the talker resolves it by name
-    if name in OPENAI_VOICES and OPENAI_VOICES[name] in voices:
+    if name is not None and name in OPENAI_VOICES and OPENAI_VOICES[name] in voices:
         return OPENAI_VOICES[name]  # OpenAI clients send "alloy"/"nova"/...
     return voices[0]
 
