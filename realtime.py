@@ -62,11 +62,11 @@ def _voice_for(name: str | None, voices: list[str]) -> str:
     return voices[0]
 
 
-def setup(engine: dict, gpu_lock: threading.Lock, voices: list[str], toolbox=None):
+def setup(engine: dict, gpu_lock: threading.Lock, voices: list[str], toolbox=None, version: str = ""):
     # `engine` is the server's ENGINE dict itself (same object): its "vad_proto" and "turn" slots
     # are filled by the boot thread, so they are read per-connection, not here.
-    E.update(engine=engine, gpu_lock=gpu_lock, voices=voices, toolbox=toolbox)
-    log(f"realtime: /v1/realtime ready ({len(voices)} voices)"
+    E.update(engine=engine, gpu_lock=gpu_lock, voices=voices, toolbox=toolbox, version=version)
+    log(f"realtime: /v1/realtime ready (version {version or 'dev'}, {len(voices)} voices)"
         + (", smart turn" if engine.get("turn") is not None else ""))
 
 
@@ -114,6 +114,7 @@ class RealtimeSession:
             "turn_detection": {"type": "server_vad", "threshold": self.vad_threshold,
                                "silence_duration_ms": self.end_ms, "prefix_padding_ms": 320},
             "tools": [], "tool_choice": "auto", "reasoning": {"effort": "none"},
+            "version": E.get("version", ""),  # which build answered: shown in client logs / health checks
         }
 
         # VAD / turn state (mirrors server.Session, minus wake word and undo/resume)
@@ -609,6 +610,7 @@ async def realtime(ws: WebSocket, model: str = ""):
         try:
             await ws.send_text(json.dumps({"type": "error",
                                            "error": {"type": "api_error", "code": "model_not_ready",
+                                                     "version": E.get("version", ""),
                                                      "message": "the model is still loading - try again shortly"}}))
         except Exception:
             pass

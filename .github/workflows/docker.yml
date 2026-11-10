@@ -33,6 +33,9 @@ jobs:
         with:
           username: ${{ vars.DOCKERHUB_USERNAME || github.repository_owner }}
           password: ${{ env.DOCKERHUB_TOKEN }}
+      - name: Version
+        id: ver
+        run: echo "version=$(tr -d '[:space:]' < VERSION)" >>"$GITHUB_OUTPUT"
       - name: Tags
         id: tags
         run: |
@@ -40,18 +43,20 @@ jobs:
           imgs=(ghcr.io/$owner/ming-voice)
           hub=${DOCKERHUB_USERNAME:-$owner}
           [ -n "$DOCKERHUB_TOKEN" ] && imgs+=(docker.io/${hub,,}/ming-voice)
-          ver=${GITHUB_REF_NAME#v}
+          # every build: the moving tags + one pinned per version, so an update always says which
+          # image it pulled (the server reports the same version in /api/health and session.created)
           tags=
           for img in "${imgs[@]}"; do
-            tags=$tags,$img:${{ matrix.flavor }}
-            [ "${{ github.event_name }}" = release ] && tags=$tags,$img:$ver-${{ matrix.flavor }}
+            tags=$tags,$img:${{ matrix.flavor }},$img:${{ matrix.flavor }}-$VER,$img:$VER-${{ matrix.flavor }}
+            [ "${{ github.event_name }}" = release ] && tags=$tags,$img:${GITHUB_REF_NAME#v}-${{ matrix.flavor }}
           done
           echo "tags=${tags#,}" >>"$GITHUB_OUTPUT"
         env:
           DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          VER: ${{ steps.ver.outputs.version }}
       - uses: docker/build-push-action@v6
         with:
           context: .
-          build-args: GPU=${{ matrix.gpu }}
+          build-args: GPU=${{ matrix.gpu }} MING_VERSION=${{ steps.ver.outputs.version }} MING_GIT_REVISION=${{ github.sha }}
           tags: ${{ steps.tags.outputs.tags }}
           push: true

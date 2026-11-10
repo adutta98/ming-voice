@@ -26,6 +26,12 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 # Settings, keys, cloned voices and caches: next to the code, or in MING_DATA_DIR (the Docker volume)
 DATA = Path(os.environ.get("MING_DATA_DIR") or HERE)
+# Version of this build. Baked into the image by the Docker build (MING_VERSION), with the VERSION
+# file that ships in the image as a fallback: /api/health and the realtime session.created report it,
+# so you can always tell which image is actually running.
+_VERSION_FILE = HERE / "VERSION"
+VERSION = (os.environ.get("MING_VERSION")
+           or (_VERSION_FILE.read_text().strip() if _VERSION_FILE.is_file() else "dev"))
 
 import warnings
 
@@ -388,7 +394,7 @@ app = FastAPI(lifespan=lifespan, title="Ming Voice", version="1.8.0",
                           "under `/v1`. From other devices (LAN port) send `Authorization: Bearer <access key>`.")
 api.setup(ENGINE, GPU_TURN, VOICES, TOOLBOX)
 app.include_router(api.router)
-realtime.setup(ENGINE, GPU_TURN, VOICES, TOOLBOX)
+realtime.setup(ENGINE, GPU_TURN, VOICES, TOOLBOX, version=VERSION)
 app.include_router(realtime.router)
 app.add_middleware(lan.AccessControl)
 
@@ -429,7 +435,8 @@ def lan_status(request: Request):
 @app.get("/api/health")
 def health():
     th = ENGINE.get("thinker")
-    return {"ready": bool(ENGINE.get("ready")), "ctx_tokens": th.ctx_len() if th else 0,
+    return {"version": VERSION, "ready": bool(ENGINE.get("ready")),
+            "ctx_tokens": th.ctx_len() if th else 0,
             "max_ctx": th.max_ctx if th else 0, "connected": ACTIVE.get("sess") is not None,
             "talker_steps": getattr(ENGINE.get("talker"), "steps", None),
             "home_assistant": "home_assistant" in TOOLBOX.names,
@@ -1380,6 +1387,8 @@ if __name__ == "__main__":
     # Local-only by default (the API accepts audio uploads and drives the GPU). Other devices reach the app
     # through windows/lan_proxy.py -> the key-protected LAN port (lan.py); HOST=0.0.0.0 exposes port 8000
     # without a key unless MING_API_KEY is set.
+    _rev = os.environ.get("MING_GIT_REVISION", "")
+    log(f"Ming Voice {VERSION}" + (f", build {_rev[:12]}" if _rev else ""))
     import socket
     socks = []
     for host, port in ((os.environ.get("HOST", "127.0.0.1"), int(os.environ.get("PORT", "8000"))),

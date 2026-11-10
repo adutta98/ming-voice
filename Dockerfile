@@ -6,9 +6,15 @@
 #   docker build --build-arg GPU=amd -t ming-voice:rocm .   AMD (ROCm 7.2)
 FROM ubuntu:24.04
 ARG GPU=nvidia
+# The build's version and git revision: reported by the server (start log, /api/health, the realtime
+# session.created) so you can tell which image is actually running.
+ARG MING_VERSION=dev
+ARG MING_GIT_REVISION=dev
 LABEL org.opencontainers.image.source=https://github.com/JMS1717/ming-voice \
       org.opencontainers.image.description="Ming Voice: a local, realtime speech-to-speech assistant" \
-      org.opencontainers.image.licenses=MIT
+      org.opencontainers.image.licenses=MIT \
+      org.opencontainers.image.version=$MING_VERSION \
+      org.opencontainers.image.revision=$MING_GIT_REVISION
 # gcc: Triton compiles a small launcher at the first GPU kernel. openssl: the phone-access certificate.
 # tini: passes `docker stop` on to the server.
 RUN apt-get update \
@@ -24,6 +30,7 @@ RUN --mount=type=cache,target=/root/.cache/uv MING_GPU=$GPU MING_SKIP_MODEL=1 ba
 COPY . .
 ENV MING_GPU=$GPU MING_DATA_DIR=/data MING_MODEL_DIR=/data/model \
     MING_TURN_MODEL=/data/model_extra/smart-turn-v3.2-cpu.onnx \
+    MING_VERSION=$MING_VERSION MING_GIT_REVISION=$MING_GIT_REVISION \
     HF_HOME=/data/cache/huggingface XDG_CACHE_HOME=/data/cache TRITON_CACHE_DIR=/data/cache/triton \
     TORCHINDUCTOR_CACHE_DIR=/data/cache/inductor \
     MIOPEN_USER_DB_PATH=/data/cache/miopen MIOPEN_CUSTOM_CACHE_DIR=/data/cache/miopen \

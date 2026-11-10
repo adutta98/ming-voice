@@ -176,6 +176,10 @@ compiles GPU kernels, which takes a while: `docker compose logs -f` shows how fa
 - **Your data** (the model, cloned voices, lists, memory, the saved conversation, settings files like `.ha_token`,
   and kernel caches) is in the volume, at `/data` in the container, so updates keep it. Update with
   `docker compose pull`, then the `up -d` line again.
+- **Versioning**: each build is versioned (the `VERSION` file, e.g. `0.3.1`) and gets a pinned image tag with it
+  (e.g. `ghcr.io/adutta98/ming-voice:cuda-0.3.1`) next to the moving `:cuda` tag. The running server says which
+  build it is at startup (`Ming Voice 0.3.1, build <git sha>`), in `GET /api/health` (`"version"`), and in the
+  `session.created` message on `/v1/realtime` — so you can always tell which image is actually loaded.
 - The always-on client needs a microphone, so it isn't in the container: use the web app, phone access or Home
   Assistant voice satellites.
 - On Windows, use the installer above: it runs Ming in WSL with direct GPU access.
