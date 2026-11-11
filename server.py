@@ -1381,6 +1381,10 @@ async def ws_endpoint(ws: WebSocket):
 
 
 if __name__ == "__main__":
+    # This file runs as __main__ (python server.py), so `import server` elsewhere would re-execute the
+    # whole module (fresh dicts, a second setup() that clobbers shared state). Aliasing the live module
+    # keeps every import of "server" on this one object.
+    sys.modules.setdefault("server", sys.modules["__main__"])
     if os.environ.get("MING_TRACEMALLOC") == "1":
         import tracemalloc
         tracemalloc.start(8)
