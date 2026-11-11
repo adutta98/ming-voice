@@ -57,6 +57,10 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: .
-          build-args: GPU=${{ matrix.gpu }} MING_VERSION=${{ steps.ver.outputs.version }} MING_GIT_REVISION=${{ github.sha }}
+          # one KEY=VALUE per line: build-push-action treats a single line as one (malformed) arg
+          build-args: |
+            GPU=${{ matrix.gpu }}
+            MING_VERSION=${{ steps.ver.outputs.version }}
+            MING_GIT_REVISION=${{ github.sha }}
           tags: ${{ steps.tags.outputs.tags }}
           push: true
