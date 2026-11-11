@@ -153,6 +153,7 @@ class RealtimeSession:
         self.create_response = True  # server_vad: auto-start the response on commit (OWUI 0.7: false -> it sends response.create with the item id)
         self.interrupt_response = True  # server_vad: barge-in cancels the playing response
         self.committed_text = ""  # user transcript for the pending (unanswered) committed turn
+        self.committed_audio = None  # the committed utterance itself, for the client-driven reply
         self.commit_item = None  # item id issued on commit, for response.create metadata
         self.out_rate = OUT_SR  # actual reply sample rate (OWUI accepts any rate)
 
@@ -321,6 +322,14 @@ class RealtimeSession:
             self.utt_pcm += raw  # client VAD: raw buffer, committed explicitly
 
     def _on_commit(self):
+        if not self.server_vad:  # client VAD: the explicit commit closes the raw input buffer
+            if len(self.utt_pcm) < 2 * int(0.1 * IN_SR):
+                self.utt_pcm = b""
+                return  # sub-100 ms noise floor
+            audio = np.frombuffer(self.utt_pcm, dtype="<i2").astype(np.float32) / 32768.0
+            self.utt_pcm = b""
+            self._commit_turn(audio)
+            return
         if self.response is not None:  # a response is already running: this is its user audio
             self.committed_audio = self._utterance()
             return
@@ -328,15 +337,59 @@ class RealtimeSession:
             return  # sub-100 ms noise floor
         audio = self._utterance()
         self._reset_listen()
+        self._commit_turn(audio)
+
+    def _commit_turn(self, audio: np.ndarray):
+        """A turn ended (server-VAD silence or explicit commit): issue its item, tell the
+        client, kick off the transcript fill-in, and answer — automatically (classic OpenAI) or
+        not at all (OWUI 0.7 create_response=false: it replies via
+        response.create {metadata: {input_item_id}} once the transcript lands)."""
+        self.committed_audio = audio
+        self.committed_text = ""
+        self.commit_item = _oid("item")
         self.send({"type": "input_audio_buffer.committed"})
         self.send({"type": "input_audio_buffer.speech_stopped", "audio_duration_ms": int(len(audio) / IN_SR * 1000)})
+        self.send({"type": "conversation.item.created", "item": {
+            "id": self.commit_item, "object": "realtime.item", "type": "message", "status": "completed",
+            "role": "user", "content": [{"type": "input_audio", "transcript": ""}]}})
+        if not self.create_response and len(audio) > 4000:  # 0.7: the client-driven reply needs the transcript
+            threading.Thread(target=self._asr_fill, args=(audio, self.commit_item), daemon=True).start()
         if self.create_response:  # classic OpenAI: the server starts the response itself
+            self.commit_item = None  # it is answered now; a later response.create for it is a retry
             self._begin_response(audio=audio)
-        else:  # OWUI 0.7: the client sends response.create {metadata:{input_item_id}} when the transcript lands
-            self.commit_item = self._commit_item_id = _oid("item")
-            self.send({"type": "conversation.item.created", "item": {
-                "id": self.commit_item, "object": "realtime.item", "type": "message", "status": "completed",
-                "role": "user", "content": [{"type": "input_audio", "transcript": ""}]}})  # the ASR fill-in follows
+        # else: OWUI 0.7 — the item stays pending until it sends response.create with its id
+
+    def _asr_fill(self, audio: np.ndarray, item_id: str):
+        """Transcript fill-in for a committed turn: stored for the client-driven reply and
+        announced as conversation.item.input_audio_transcription.completed (OWUI 0.7 waits for
+        it before driving the reply)."""
+        try:
+            with E["gpu_lock"]:
+                t = E["engine"]["thinker"].transcribe(audio, max_new_tokens=160)
+        except Exception as e:
+            log("realtime: transcribe error:", repr(e))
+            return
+        if not t:
+            return
+        self.committed_text = t
+        log(f"realtime heard: {t!r}")
+        if item_id == self.commit_item:  # the turn may have been abandoned (barge-in / clear)
+            self.send({"type": "conversation.item.input_audio_transcription.completed",
+                       "item_id": item_id, "content_index": 0, "transcript": t})
+
+    def _on_clear(self):
+        # input_audio_buffer.clear: drop buffered audio and abandon a committed-but-unanswered
+        # turn (the client changes its mind; a response already running is the client's call
+        # via response.cancel)
+        if self.server_vad:
+            self._reset_listen()
+            self.tail = np.zeros(0, dtype=np.float32)
+        else:
+            self.utt_pcm = b""
+        self.committed_audio = None
+        self.committed_text = ""
+        self.commit_item = None
+        self.send({"type": "input_audio_buffer.cleared"})
 
     def _on_item_create(self, item: dict):
         role = item.get("role")
@@ -385,15 +438,25 @@ class RealtimeSession:
         if resp.get("instructions"):
             self.chat_context = resp["instructions"]
         item_id = meta.get("input_item_id")
-        if item_id == self.commit_item and not user_text:
-            # OWUI 0.7 (create_response=false): this is the reply request for the turn we just committed —
-            # answer with its transcript (or the voice turn itself); OWUI would otherwise sit in silence.
-            user_text = self.committed_text or None
+        audio = None
+        if item_id == self.commit_item:
+            # OWUI 0.7 (create_response=false): this is the reply request for the turn we just
+            # committed — answer from the voice turn itself (the transcript is the fallback when
+            # the audio was too short to keep); OWUI would otherwise sit in silence.
+            audio = self.committed_audio
+            if not user_text:
+                user_text = self.committed_text or None
         if self.response is not None:
             self._cancel_response("new response requested")
-        self._begin_response(user_text=user_text or (self.pending_text or None), audio=None)
-        self.pending_text = ""
         self.commit_item = None
+        self.committed_audio = None
+        self.committed_text = ""
+        if audio is not None:  # the committed voice turn is the truth: no second text source
+            self._begin_response(audio=audio, input_item_id=item_id, heard=user_text)
+        else:
+            self._begin_response(user_text=user_text or (self.pending_text or None),
+                                 input_item_id=item_id)
+        self.pending_text = ""
 
     def _on_item_delete(self, item_id):
         # OWUI 0.7 deletes stale items; Ming's context is rebuilt per turn, so there is nothing to remove
@@ -479,14 +542,8 @@ class RealtimeSession:
         if silence_ms >= self._end_of_turn_ms(silence_ms, speech_s, long_enough):
             audio = self._utterance()
             self._reset_listen()
-            self.send({"type": "input_audio_buffer.speech_stopped",
-                       "audio_duration_ms": int(speech_s * 1000)})
-            if long_enough:
-                if self.create_response:  # classic OpenAI: respond automatically
-                    self._begin_response(audio=audio)
-                # else: OWUI 0.7 — it sends response.create with metadata.input_item_id once the transcript
-                # is final (its protocol always does, and it needs the item id for that message)
-                self._begin_response(audio=audio)
+            if long_enough:  # a real turn: _commit_turn decides who answers (0.3.4: it used
+                self._commit_turn(audio)  # to auto-respond here even with create_response=false)
 
     def _end_of_turn_ms(self, silence_ms: int, speech_s: float, long_enough: bool) -> int:
         extra = self.short_extra_ms if speech_s < 1.0 else 0
@@ -535,21 +592,27 @@ class RealtimeSession:
         self.play_until = 0.0
         self.speaking_frames = 0
         self.committed_text = ""  # a barge-in abandons the interrupted turn
-        self.send({"type": "response.cancelled", "response": {
-            "id": resp_id, "object": "realtime.response", "status": "cancelled", "output": []}})
+        self.committed_audio = None
+        self.commit_item = None
+        resp = {"id": resp_id, "object": "realtime.response", "status": "cancelled", "output": []}
+        self.send({"type": "response.cancelled", "response": resp})
+        self.send({"type": "response.done", "response": resp})
         if reason == "barge-in":
             log("realtime: barged in")
 
-    def _begin_response(self, audio: np.ndarray | None = None, user_text: str | None = None):
+    def _begin_response(self, audio: np.ndarray | None = None, user_text: str | None = None,
+                        input_item_id: str | None = None, heard: str | None = None):
         self.response = None  # close the previous slot before the new thread can race it
         cancel = threading.Event()
         resp_id, item_id = _oid("resp"), _oid("item")
-        worker = threading.Thread(target=self._run_response, args=(resp_id, item_id, audio, user_text, cancel),
+        worker = threading.Thread(target=self._run_response,
+                                  args=(resp_id, item_id, audio, user_text, cancel, input_item_id, heard),
                                   daemon=True)
         worker.start()
         self.response = (resp_id, item_id, cancel, worker)
 
-    def _run_response(self, resp_id: str, item_id: str, audio, user_text, cancel: threading.Event):
+    def _run_response(self, resp_id: str, item_id: str, audio, user_text, cancel: threading.Event,
+                      input_item_id: str | None = None, heard: str | None = None):
         th, tk = E["engine"]["thinker"], E["engine"]["talker"]
         toolbox = E.get("toolbox")
         # snapshot the per-session context (system prompt / item priming); OWUI 0.7 updates it every turn
@@ -557,9 +620,11 @@ class RealtimeSession:
         chat_context = (self.chat_context or "").strip()
         if dialect and chat_context and dialect not in chat_context:  # dialect last: it wins over the prompt
             chat_context = f"{chat_context}\n\n{dialect}"
-        self.send({"type": "response.created", "response": {
-            "id": resp_id, "object": "realtime.response", "status": "in_progress",
-            "model": self.model, "modalities": self.modalities, "voice": self.voice, "output": []}})
+        resp = {"id": resp_id, "object": "realtime.response", "status": "in_progress",
+                "model": self.model, "modalities": self.modalities, "voice": self.voice, "output": []}
+        if input_item_id:  # client-driven (OWUI 0.7): echo the input item it asked for
+            resp["metadata"] = {"input_item_id": input_item_id}
+        self.send({"type": "response.created", "response": resp})
         self.send({"type": "response.output_item.added", "response_id": resp_id, "output_index": 0,
                    "item": {"id": item_id, "object": "realtime.item", "type": "message",
                             "status": "in_progress", "role": "assistant", "content": []}})
@@ -681,24 +746,28 @@ class RealtimeSession:
                    "item": {"id": item_id, "object": "realtime.item", "type": "message",
                             "status": "completed", "role": "assistant",
                             "content": [{"type": "audio", "transcript": full, "id": _oid("audio")}]}})
-        self.send({"type": "response.completed", "response": {
-            "id": resp_id, "object": "realtime.response", "status": "completed", "model": self.model,
-            "voice": self.voice,
-            "output": [{"id": item_id, "type": "message", "role": "assistant",
-                        "content": [{"type": "audio", "transcript": full}]}],
-            "usage": {"input_tokens": th.ctx_len(), "output_tokens": max(1, n_out),
-                      "total_tokens": th.ctx_len() + max(1, n_out)}  # OWUI 0.7 requires usage in response.completed
-        }})  # closes the response dict + the send dict, then the send call
+        resp = {"id": resp_id, "object": "realtime.response", "status": "completed", "model": self.model,
+                "voice": self.voice,
+                "output": [{"id": item_id, "type": "message", "role": "assistant",
+                            "content": [{"type": "audio", "transcript": full}]}],
+                "usage": {"input_tokens": th.ctx_len(), "output_tokens": max(1, n_out),
+                          "total_tokens": th.ctx_len() + max(1, n_out)}}  # OWUI 0.7 requires usage in response.completed
+        if input_item_id:
+            resp["metadata"] = {"input_item_id": input_item_id}
+        self.send({"type": "response.completed", "response": resp})
+        self.send({"type": "response.done", "response": resp})  # OWUI 0.7's bridge polls response.done
 
-        # background ASR of the user's utterance (same as the main app): the transcript for the record
+        # transcript for the record: reuse the one the commit path already got (0.7), else ASR it here
         if audio is not None and len(audio) > 4000:
             def asr():
-                try:
-                    with E["gpu_lock"]:
-                        t = th.transcribe(audio, max_new_tokens=160)
-                except Exception as e:
-                    log("realtime: transcribe error:", repr(e))
-                    return
+                t = heard
+                if t is None:
+                    try:
+                        with E["gpu_lock"]:
+                            t = th.transcribe(audio, max_new_tokens=160)
+                    except Exception as e:
+                        log("realtime: transcribe error:", repr(e))
+                        return
                 if t:
                     log(f"realtime heard: {t!r}")
                     if th.history:
