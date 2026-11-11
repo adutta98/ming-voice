@@ -86,6 +86,8 @@ class RealtimeSession:
         self.ws, self.loop = ws, loop
         self.out: asyncio.Queue = asyncio.Queue()
         self.close_evt = threading.Event()
+        self._decl_logged = False  # diagnostic: log the client's session declaration once
+        self.n_appends = 0  # diagnostic: inbound audio frames
 
         self.model = model or DEFAULT_MODEL
         self.voice = E["voices"][0]
@@ -175,12 +177,26 @@ class RealtimeSession:
             # conversation.created is deferred on purpose: strict one-message-at-a-time clients
             # (Open WebUI's realtime bridge) must see session.updated as the reply to their
             # session.update, and an interleaved conversation.created breaks the handshake.
+            closed = False
             while not self.close_evt.is_set():
-                msg = json.loads(await self.ws.receive_text())
+                m = await self.ws.receive()
+                if m.get("type") == "websocket.disconnect":
+                    closed = True
+                    break
+                raw = m.get("text")
+                if raw is None and m.get("bytes") is not None:
+                    # some clients (e.g. Open WebUI 0.7's mobile app) send the JSON over the
+                    # binary opcode; receive_text() would crash with KeyError('text')
+                    raw = bytes(m["bytes"]).decode("utf-8", "replace")
+                if not raw:
+                    continue
+                msg = json.loads(raw)
                 if msg.get("type") != "session.update":
                     self._send_conv_created()  # clients that never send it get it before anything else
                 self._dispatch(msg)
-        except (WebSocketDisconnect, json.JSONDecodeError) as e:
+            if closed:
+                log("realtime: connection closed (WebSocketDisconnect)")
+        except (WebSocketDisconnect, UnicodeDecodeError, json.JSONDecodeError) as e:
             log(f"realtime: connection closed ({type(e).__name__})")
         except Exception as e:
             log("realtime: session error:", repr(e))
@@ -212,6 +228,8 @@ class RealtimeSession:
 
     def _dispatch(self, msg: dict):
         t = msg.get("type")
+        if t != "input_audio_buffer.append":  # diagnostic: everything the client says (audio counted separately)
+            log(f"rt: recv {t}")
         try:
             if t == "session.update":
                 self._on_session_update(msg.get("session") or {})
@@ -246,6 +264,13 @@ class RealtimeSession:
         # Two wire shapes: classic top-level (voice, modalities, turn_detection, ...) and the nested
         # audio.input/audio.output shape that Open WebUI >= 0.7 sends (24 kHz in/out, server_vad with
         # create_response/interrupt_response flags, transcription.model). Top-level values win when set.
+        if not self._decl_logged:  # diagnostic: 0.7 re-sends this every turn, so log it once
+            self._decl_logged = True
+            td0 = s.get("turn_detection") or (s.get("audio") or {}).get("input", {}).get("turn_detection") or {}
+            log(f"rt: declared: model={s.get('model')} create_response={td0.get('create_response')} "
+                f"interrupt={td0.get('interrupt_response')} in={(s.get('audio') or {}).get('input', {}).get('format')} "
+                f"out={(s.get('audio') or {}).get('output', {}).get('format')} "
+                f"silence_ms={td0.get('silence_duration_ms')} tools={len(s.get('tools') or [])}")
         a_in = (s.get("audio") or {}).get("input") or {}
         a_out = (s.get("audio") or {}).get("output") or {}
         if a_in or a_out:
@@ -307,6 +332,9 @@ class RealtimeSession:
         if not raw:
             return
         self.audio_ms += len(raw) // 2 / self.in_rate * 1000
+        self.n_appends += 1
+        if self.n_appends % 250 == 1:  # diagnostic: ~8 s of 32 ms frames
+            log(f"rt: audio {self.n_appends} appends (~{self.audio_ms / 1000:.1f} s)")
         if self.in_rate != IN_SR:  # e.g. Open WebUI declares 24 kHz; the VAD/ASR run at 16 kHz
             if self._res_in is None:
                 self._res_in = StreamResampler(self.in_rate, IN_SR)
@@ -347,6 +375,7 @@ class RealtimeSession:
         self.committed_audio = audio
         self.committed_text = ""
         self.commit_item = _oid("item")
+        log(f"rt: commit item={self.commit_item} audio={len(audio) / IN_SR * 1000:.0f} ms (create_response={self.create_response})")
         self.send({"type": "input_audio_buffer.committed"})
         self.send({"type": "input_audio_buffer.speech_stopped", "audio_duration_ms": int(len(audio) / IN_SR * 1000)})
         self.send({"type": "conversation.item.created", "item": {
@@ -370,12 +399,14 @@ class RealtimeSession:
             log("realtime: transcribe error:", repr(e))
             return
         if not t:
+            log(f"rt: no transcript for {item_id} (asr returned empty)")
             return
         self.committed_text = t
         log(f"realtime heard: {t!r}")
         if item_id == self.commit_item:  # the turn may have been abandoned (barge-in / clear)
             self.send({"type": "conversation.item.input_audio_transcription.completed",
                        "item_id": item_id, "content_index": 0, "transcript": t})
+            log(f"rt: sent transcription.completed for {item_id} - waiting for response.create")
 
     def _on_clear(self):
         # input_audio_buffer.clear: drop buffered audio and abandon a committed-but-unanswered
@@ -438,6 +469,8 @@ class RealtimeSession:
         if resp.get("instructions"):
             self.chat_context = resp["instructions"]
         item_id = meta.get("input_item_id")
+        log(f"rt: response.create input_item_id={item_id!r} (pending={self.commit_item!r}) "
+            f"match={item_id == self.commit_item} user_text={(user_text or '')[:40]!r}")
         audio = None
         if item_id == self.commit_item:
             # OWUI 0.7 (create_response=false): this is the reply request for the turn we just
@@ -610,6 +643,8 @@ class RealtimeSession:
                                   daemon=True)
         worker.start()
         self.response = (resp_id, item_id, cancel, worker)
+        log(f"rt: response begin (audio={'yes' if audio is not None else 'no'} "
+            f"text={((user_text or heard) or '')[:40]!r})")
 
     def _run_response(self, resp_id: str, item_id: str, audio, user_text, cancel: threading.Event,
                       input_item_id: str | None = None, heard: str | None = None):
@@ -637,6 +672,8 @@ class RealtimeSession:
         text_parts: list[str] = []
         n_samples = 0
 
+        first_audio = [True]
+
         def talker_loop():
             nonlocal n_samples
             res = StreamResampler()    # 44.1 -> wire rate (24 kHz; the session can request another — audio.delta says which)
@@ -661,6 +698,9 @@ class RealtimeSession:
                             break
                         y24 = res.push(pcm)  # 24 kHz, per the session's output format
                         if y24.size:
+                            if first_audio[0]:
+                                first_audio[0] = False
+                                log(f"rt: response first audio ({len(y24)} samples @ {self.out_rate} Hz)")
                             n_samples += len(y24)
                             with self.echo_lock:
                                 start = max(self.play_until, time.time())  # chain contiguously (the client keeps its own jitter buffer)
@@ -756,6 +796,7 @@ class RealtimeSession:
             resp["metadata"] = {"input_item_id": input_item_id}
         self.send({"type": "response.completed", "response": resp})
         self.send({"type": "response.done", "response": resp})  # OWUI 0.7's bridge polls response.done
+        log(f"rt: response done ({n_samples / self.out_rate:.1f} s audio, {len(full)} chars)")
 
         # transcript for the record: reuse the one the commit path already got (0.7), else ASR it here
         if audio is not None and len(audio) > 4000:
