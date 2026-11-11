@@ -17,10 +17,20 @@ LABEL org.opencontainers.image.source=https://github.com/JMS1717/ming-voice \
       org.opencontainers.image.revision=$MING_GIT_REVISION
 # gcc: Triton compiles a small launcher at the first GPU kernel. openssl: the phone-access certificate.
 # tini: passes `docker stop` on to the server.
-RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-       ca-certificates curl gcc libc6-dev openssl tini \
-    && rm -rf /var/lib/apt/lists/*
+# apt-get update exits 0 even when every source fails to fetch (e.g. transient DNS on the runner),
+# leaving apt install with no candidates and a confusing "no installation candidate" error; retry
+# until the indexes actually resolve before installing
+RUN set -eu; \
+    attempt=1; \
+    until apt-get update && apt-get install --dry-run -y --no-install-recommends ca-certificates; do \
+        attempt=$((attempt + 1)); \
+        [ "$attempt" -gt 5 ] && { echo "apt repositories unreachable after 5 attempts"; exit 1; }; \
+        echo "apt update could not fetch the package indexes (attempt $((attempt - 1))), retrying in 5s..."; \
+        sleep 5; \
+    done; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates curl gcc libc6-dev openssl tini; \
+    rm -rf /var/lib/apt/lists/*
 COPY --from=ghcr.io/astral-sh/uv:0.11.14 /uv /usr/local/bin/uv
 WORKDIR /app
 ENV UV_PYTHON_INSTALL_DIR=/opt/python UV_LINK_MODE=copy
