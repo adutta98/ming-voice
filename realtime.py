@@ -157,6 +157,7 @@ class RealtimeSession:
         self.committed_text = ""  # user transcript for the pending (unanswered) committed turn
         self.committed_audio = None  # the committed utterance itself, for the client-driven reply
         self.commit_item = None  # item id issued on commit, for response.create metadata
+        self.vad_item = None  # 0.3.8: item id pre-allocated at VAD start, named on the speech events
         self._swallowed: set[str] = set()  # committed turns with no reply (noise / stop); their response.create is absorbed
         self.out_rate = OUT_SR  # actual reply sample rate (OWUI accepts any rate)
 
@@ -253,6 +254,8 @@ class RealtimeSession:
                 self._on_response_create(msg)
             elif t == "response.cancel":
                 self._cancel_response("client")
+            elif t == "bridge.ping":
+                self.send({"type": "bridge.pong"})  # 0.3.8: keep the client's keep-alive watchdog alive
             elif t.startswith(("session.", "conversation.item.", "response.", "input_audio_buffer.")):
                 pass  # accepted and ignored (protocol completeness: item.created/removed, output events)
             else:
@@ -375,10 +378,12 @@ class RealtimeSession:
         response.create {metadata: {input_item_id}} once the transcript lands)."""
         self.committed_audio = audio
         self.committed_text = ""
-        self.commit_item = _oid("item")
+        self.commit_item = self.vad_item or _oid("item")  # 0.3.8: keep the id the client saw on speech_started
+        self.vad_item = None
         log(f"rt: commit item={self.commit_item} audio={len(audio) / IN_SR * 1000:.0f} ms (create_response={self.create_response})")
         self.send({"type": "input_audio_buffer.committed"})
-        self.send({"type": "input_audio_buffer.speech_stopped", "audio_duration_ms": int(len(audio) / IN_SR * 1000)})
+        self.send({"type": "input_audio_buffer.speech_stopped", "item_id": self.commit_item,
+                   "audio_duration_ms": int(len(audio) / IN_SR * 1000)})
         self.send({"type": "conversation.item.created", "item": {
             "id": self.commit_item, "object": "realtime.item", "type": "message", "status": "completed",
             "role": "user", "content": [{"type": "input_audio", "transcript": ""}]}})
@@ -445,6 +450,7 @@ class RealtimeSession:
         self.committed_audio = None
         self.committed_text = ""
         self.commit_item = None
+        self.vad_item = None
         self.send({"type": "input_audio_buffer.cleared"})
 
     def _on_item_create(self, item: dict):
@@ -558,11 +564,13 @@ class RealtimeSession:
                 self.preroll = self.preroll[-10:]
                 if p >= self.vad_threshold and not self.in_speech:
                     self.in_speech = True
+                    self.vad_item = _oid("item")
                     self.frames = list(self.preroll)
                     self.speech_frames, self.pause_frames = 1, 0
                     self.speech_rms, self.n_loud = 0.0, 0
                     self.turn_fut, self.turn_p = None, None
                     self.send({"type": "input_audio_buffer.speech_started",
+                               "item_id": self.vad_item,
                                "audio_start_ms": int(self.audio_ms - 320)})
             return
 
@@ -573,11 +581,13 @@ class RealtimeSession:
             self.preroll = self.preroll[-10:]  # ~320 ms of prefix padding
             if p >= self.vad_threshold:
                 self.in_speech = True
+                self.vad_item = _oid("item")
                 self.frames = list(self.preroll)
                 self.speech_frames, self.pause_frames = 1, 0
                 self.speech_rms, self.n_loud = 0.0, 0
                 self.turn_fut, self.turn_p = None, None
                 self.send({"type": "input_audio_buffer.speech_started",
+                           "item_id": self.vad_item,
                            "audio_start_ms": int(self.audio_ms - 320)})
             return
 
@@ -636,6 +646,7 @@ class RealtimeSession:
 
     def _reset_listen(self):
         self.in_speech = False
+        self.vad_item = None
         self.frames = []
         self.speech_frames, self.pause_frames = 0, 0
         self.speech_rms, self.n_loud = 0.0, 0
