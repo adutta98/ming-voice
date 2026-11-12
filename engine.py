@@ -70,13 +70,42 @@ CLAIMS = [
     (re.compile(r"\b(i'll|i will) remember\b", re.I), "memory", "remember"),
 ]
 BYE = re.compile(r"\b(bye|goodbye|good ?night|talk to you (later|soon)|see you|have a (great|good|nice|lovely|wonderful) "
-                 r"(day|night|evening|weekend|one)|until next time|take care)\b", re.I)  # (a reply saying goodbye)
+                  r"(day|night|evening|weekend|one)|until next time|take care)\b", re.I)  # (a reply saying goodbye)
+# A turn that is only this is a request to stop talking: "stop" said while we are still talking must be met
+# with silence, never with an answer. Softeners (please / ok / can you ...) and a trailing "please" are allowed,
+# as are "shut up", "be quiet", "enough", "cancel" - but a "stop" inside a longer sentence
+# ("the stop sign", "what stopped you") never matches, and neither does "don't stop".
+STOP_RE = re.compile(r"""^\s*
+    (?:
+        [a-z ]*\bstop\b
+        |
+        (?:please\s+|okay\s+|ok\s+|can\s+you\s+|\bcould\s+you\s+|hey\s+)?
+        (?:
+            \bstop\b\s+(?:it|talking|up|that|now)(?:\s+now)?
+            |
+            \bshut\b\s+up(?:\s+now)?
+        )
+        |
+        (?:please\s+|okay\s+|ok\s+|can\s+you\s+|\bcould\s+you\s+|hey\s+)?\b(?:stop|shut)\b
+        |
+        (?:please\s+|okay\s+|ok\s+)?\b(?:be\s+quiet|quiet|silence|be\s+silent|be\s+done|enough|(?:that'?s|that\s+is)\s+enough|cancel|hush(?:\s+\w+)?|shh)\b
+    )
+    \s*(?:please)?\s*$""", re.I | re.X)
+
+
+def is_stop_command(text: str) -> bool:
+    """True when the user's turn is an instruction to stop (spoken or typed "stop" / "shut up" / ...)."""
+    cleaned = re.sub(r"[^\w\s']", " ", text or "")  # drop punctuation (commas, !, ?) before matching
+    cleaned = re.sub(r"\s+", " ", cleaned).lower().strip()
+    return bool(STOP_RE.match(cleaned))
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are Ming, a friendly, helpful voice assistant in a live spoken conversation. "
     "Listen to the user's speech and reply naturally in the same language they speak. "
     "Keep replies short and conversational, usually one to three sentences, unless the user asks for more detail. "
-    "Use plain spoken language only: no markdown, bullet points, emojis, or code."
+    "Use plain spoken language only: no markdown, bullet points, emojis, or code. "
+    "Never repeat a previous reply word for word; when the user asks the same thing again, answer it in "
+    "different words. If the user tells you to stop, stay silent."
 )
 
 
@@ -991,7 +1020,8 @@ class Thinker:
 
     @torch.inference_mode()
     def stream(self, wav16k: np.ndarray, cancel: threading.Event | None = None, max_new_tokens: int = 400,
-               user_text: str | None = None, history_text: str = "", events: bool = False, gate=None):
+               user_text: str | None = None, history_text: str = "", events: bool = False, gate=None,
+               heard_text: str | None = None):
         """Yield text deltas of the assistant reply to one user utterance (16 kHz mono float32) and/or text.
         history_text: earlier turns (render_history) inserted after the system prompt on a fresh context.
         With self.tools set, the model may call tools first; they run here (GPU idle meanwhile) and the reply
@@ -1002,13 +1032,38 @@ class Thinker:
         feats = {}
         human = ""
         heard = {}
+        wav0 = wav16k
 
-        def said() -> str:  # what the user said (only transcribed when a tool needs it: ~0.2 s)
+        # A voice turn: produce the transcript now - the gates below need it, and any tool that runs wants it
+        # anyway (~0.2 s, once per turn)
+        if wav0 is not None and user_text is None:
+            # the caller may already hold the transcript (the realtime bridge transcribes on commit)
+            heard["text"] = (heard_text or self.transcribe(wav0, max_new_tokens=60)).strip()
+        elif user_text is not None:
+            heard["text"] = user_text.strip()
+        heard_text = heard.get("text") or ""
+        skip_history = False
+        if wav0 is not None and not any(c.isalpha() for c in heard_text):
+            # No speech in the transcript (empty or punctuation only): background noise. Silence beats a guess -
+            # answering noise is what starts loops of self-introduction
+            log(f"turn ignored (no speech in transcript {heard_text!r})")
+            if events:
+                yield {"type": "turn_ignored", "text": heard_text}
+            skip_history = True
+            return
+        if is_stop_command(heard_text):
+            # "Stop" while we were still talking (or typed in the box): silence, plus a cue for the client to
+            # cancel playback
+            log(f"stop command: {heard_text!r}")
+            if events:
+                yield {"type": "stop", "text": heard_text}
+            return  # the finally block records the turn: the user said stop, we said nothing
+
+        def said() -> str:  # what the user said
             if "text" not in heard:
                 spoken = self.transcribe(wav0, max_new_tokens=60) if wav0 is not None else ""
                 heard["text"] = (spoken + " " + (user_text or "")).strip()
             return heard["text"]
-        wav0 = wav16k
         if wav16k is not None:
             wav16k = pad_to_bucket(wav16k)
             mel = self._mel(torch.from_numpy(np.ascontiguousarray(wav16k, dtype=np.float32)).to(DEVICE),
@@ -1225,8 +1280,15 @@ class Thinker:
         finally:
             # The last sampled token (EOS or the interrupted one) was never fed; close the turn.
             self.pending = ROLE_END
-            self.history.append({"role": "assistant", "content": self.tok.decode(gen, skip_special_tokens=True),
-                                 "interrupted": cancel.is_set(), "user": user_text})
+            if not skip_history:
+                content = self.tok.decode(gen, skip_special_tokens=True)
+                if self.history and self.history[-1].get("role") == "assistant" \
+                        and self.history[-1].get("content") == content and content.strip():
+                    # Two identical replies back to back: keeping both in context is exactly what makes the
+                    # model repeat them - drop the older one
+                    self.history.pop()
+                self.history.append({"role": "assistant", "content": content,
+                                     "interrupted": cancel.is_set(), "user": user_text})
 
 
 # --------------------------------------------------------------------------- Talker

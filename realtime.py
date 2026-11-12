@@ -33,7 +33,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from api import OPENAI_VOICES, StreamResampler
 from echo_guard import EchoGuard
-from engine import Fragmenter, Talker, log
+from engine import Fragmenter, Talker, is_stop_command, log
 from tools import FILLERS  # spoken while a tool runs (same fillers as the main app)
 
 router = APIRouter(prefix="/v1")
@@ -157,6 +157,7 @@ class RealtimeSession:
         self.committed_text = ""  # user transcript for the pending (unanswered) committed turn
         self.committed_audio = None  # the committed utterance itself, for the client-driven reply
         self.commit_item = None  # item id issued on commit, for response.create metadata
+        self._swallowed: set[str] = set()  # committed turns with no reply (noise / stop); their response.create is absorbed
         self.out_rate = OUT_SR  # actual reply sample rate (OWUI accepts any rate)
 
     # ---------- transport ----------
@@ -400,6 +401,17 @@ class RealtimeSession:
             return
         if not t:
             log(f"rt: no transcript for {item_id} (asr returned empty)")
+            if item_id == self.commit_item:  # still this turn: complete the client's state, absorb the reply
+                self._swallow_item(item_id, "")
+            return
+        if (not any(c.isalpha() for c in t)) or is_stop_command(t):
+            # no speech (noise) or a stop command: this turn gets no reply - answering noise is what
+            # starts loops of self-introduction, and a "stop" must be met with silence
+            if item_id != self.commit_item:  # abandoned meanwhile (barge-in / clear): nothing to do
+                return
+            if is_stop_command(t):
+                self._cancel_response("stop command")
+            self._swallow_item(item_id, t)
             return
         self.committed_text = t
         log(f"realtime heard: {t!r}")
@@ -407,6 +419,19 @@ class RealtimeSession:
             self.send({"type": "conversation.item.input_audio_transcription.completed",
                        "item_id": item_id, "content_index": 0, "transcript": t})
             log(f"rt: sent transcription.completed for {item_id} - waiting for response.create")
+
+    def _swallow_item(self, item_id: str, t: str):
+        """A committed turn that gets no reply (noise or a stop command): show its transcript so the
+        user sees it was heard, and absorb the client's reply request for it."""
+        if len(self._swallowed) > 256:
+            self._swallowed.clear()
+        self._swallowed.add(item_id)
+        self.commit_item = None
+        self.committed_audio = None
+        self.committed_text = ""
+        self.send({"type": "conversation.item.input_audio_transcription.completed",
+                   "item_id": item_id, "content_index": 0, "transcript": t})
+        log(f"rt: swallowed {item_id} ({t[:60]!r}) - no reply")
 
     def _on_clear(self):
         # input_audio_buffer.clear: drop buffered audio and abandon a committed-but-unanswered
@@ -471,6 +496,10 @@ class RealtimeSession:
         item_id = meta.get("input_item_id")
         log(f"rt: response.create input_item_id={item_id!r} (pending={self.commit_item!r}) "
             f"match={item_id == self.commit_item} user_text={(user_text or '')[:40]!r}")
+        if item_id in self._swallowed:
+            log(f"rt: response.create for absorbed turn {item_id} - no reply")
+            self._absorb_response(item_id)
+            return
         audio = None
         if item_id == self.commit_item:
             # OWUI 0.7 (create_response=false): this is the reply request for the turn we just
@@ -619,6 +648,7 @@ class RealtimeSession:
         if r is None:
             return
         resp_id, item_id, cancel, worker = r
+        already = cancel.is_set()
         cancel.set()
         with self.echo_lock:
             self.echo.truncate(time.time() + 0.25)  # playback stops; what is in flight still echoes
@@ -627,11 +657,26 @@ class RealtimeSession:
         self.committed_text = ""  # a barge-in abandons the interrupted turn
         self.committed_audio = None
         self.commit_item = None
-        resp = {"id": resp_id, "object": "realtime.response", "status": "cancelled", "output": []}
+        if not already:  # (already cancelled - a second barge-in or a late "stop" - no duplicate events)
+            resp = {"id": resp_id, "object": "realtime.response", "status": "cancelled", "output": []}
+            self.send({"type": "response.cancelled", "response": resp})
+            self.send({"type": "response.done", "response": resp})
+        if reason == "barge-in":
+            log("rt: barged in")
+        elif reason == "stop command":
+            log("rt: stop command - response cancelled")
+
+    def _absorb_response(self, item_id: str | None):
+        """Complete a client-driven response without replying (its turn was swallowed: no speech, or a stop
+        command): created, cancelled, done - the client's state machine finishes, and the audio stays silent."""
+        resp = {"id": _oid("resp"), "object": "realtime.response", "status": "in_progress",
+                "model": self.model, "modalities": self.modalities, "voice": self.voice, "output": []}
+        if item_id:
+            resp["metadata"] = {"input_item_id": item_id}
+        self.send({"type": "response.created", "response": resp})
+        resp["status"] = "cancelled"
         self.send({"type": "response.cancelled", "response": resp})
         self.send({"type": "response.done", "response": resp})
-        if reason == "barge-in":
-            log("realtime: barged in")
 
     def _begin_response(self, audio: np.ndarray | None = None, user_text: str | None = None,
                         input_item_id: str | None = None, heard: str | None = None):
@@ -650,6 +695,7 @@ class RealtimeSession:
                       input_item_id: str | None = None, heard: str | None = None):
         th, tk = E["engine"]["thinker"], E["engine"]["talker"]
         toolbox = E.get("toolbox")
+        hist_len = len(th.history)  # the stream adds at most one entry (a turn the engine kept)
         # snapshot the per-session context (system prompt / item priming); OWUI 0.7 updates it every turn
         dialect = E.get("dialect")
         chat_context = (self.chat_context or "").strip()
@@ -738,9 +784,16 @@ class RealtimeSession:
             with E["gpu_lock"]:
                 if toolbox is not None:
                     th.set_tools(toolbox)
-                for delta in th.stream(audio, cancel=cancel, user_text=user_text,
+                for delta in th.stream(audio, cancel=cancel, user_text=user_text, heard_text=heard,
                                        max_new_tokens=self.max_out, events=True, history_text=chat_context):
                     if isinstance(delta, dict):  # a tool call / its result (Ming runs its own tools)
+                        if delta.get("type") == "stop":
+                            # "stop": cancel this response (the client stops playback); the engine
+                            # recorded nothing, so the next turn starts from a clean context
+                            self._cancel_response("stop command")
+                            continue
+                        if delta.get("type") == "turn_ignored":
+                            continue  # no speech in the turn: complete below with an empty reply
                         if delta.get("type") == "tool_call" and not text.strip():
                             filler = FILLERS.get(delta.get("name"))
                             if filler:  # it went straight to a tool: say something meanwhile
@@ -820,7 +873,8 @@ class RealtimeSession:
                         return
                 if t:
                     log(f"realtime heard: {t!r}")
-                    if th.history:
+                    # only the turn this reply answers (turns the engine dropped - noise / stop - add none)
+                    if th.history and len(th.history) > hist_len:
                         th.history[-1]["user"] = t
             threading.Thread(target=asr, daemon=True).start()
 

@@ -1103,6 +1103,7 @@ class Session:
             TOOLBOX.home, TOOLBOX.persona, TOOLBOX.room = self.home, self.persona, self.room
             th.set_tools(TOOLBOX if self.tools else None)  # (rebuilds the context when this changed)
             snap = r.snap = th.snapshot()
+            hist_len = len(th.history)
             try:
                 self._generate(r, th, tk)
             finally:
@@ -1110,7 +1111,8 @@ class Session:
                     r.decided.wait(timeout=10)
                     if not r.committed:
                         th.restore(snap)
-            if r.committed and not r.undone and r.audio is not None and len(r.audio) > 4000:
+            if r.committed and not r.undone and r.audio is not None and len(r.audio) > 4000 \
+                    and len(th.history) > hist_len:  # the engine kept this turn (noise / stop add none)
                 self._transcribe_user(r, th)
             with self.undo_lock:  # (restore outside the lock: the event loop takes it)
                 r.finished = True
@@ -1179,6 +1181,13 @@ class Session:
                 if isinstance(delta, dict):  # a tool call / its result
                     if delta.get("end"):  # the user said goodbye: end the conversation after this reply
                         r.end = True
+                    if delta["type"] == "stop":
+                        # "stop": silence the playing reply; the engine recorded nothing, so the
+                        # next turn starts from a clean context
+                        r.cancel.set()
+                        continue
+                    if delta["type"] == "turn_ignored":
+                        continue  # no speech in the turn: complete below with nothing said
                     if delta["type"] == "tool_call":
                         for piece in fr.flush():  # speak what it said before calling the tool
                             frag_q.put(piece)
