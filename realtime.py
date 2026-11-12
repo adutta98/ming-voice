@@ -8,7 +8,7 @@ over one WebSocket — no separate STT/TTS leg. Works with:
 
 Wire format (OpenAI Realtime standard):
   * in:  16 kHz mono PCM16, base64, `input_audio_buffer.append`
-  * out: 24 kHz mono PCM16, base64, `response.audio.delta`
+  * out: 24 kHz mono PCM16, base64 — sent as response.audio.delta and response.output_audio.delta
   * turns: server-side VAD (Silero) + the same smart-turn model as the main app; the assistant can be
     barged in on (its own voice is filtered out by the echo guard).
 
@@ -706,11 +706,14 @@ class RealtimeSession:
                                 start = max(self.play_until, time.time())  # chain contiguously (the client keeps its own jitter buffer)
                                 self.play_until = start + len(pcm) / Talker.SR
                                 self.echo.add_playback(ref.push(pcm), start)
-                            self.send({"type": "response.audio.delta", "response_id": resp_id,
-                                       "item_id": item_id, "content_index": 0,
-                                       "sample_rate": self.out_rate,
-                                       "delta": base64.b64encode(
-                                           (np.clip(y24, -1, 1) * 32767).astype("<i2").tobytes()).decode()})
+                            a_payload = {"response_id": resp_id, "item_id": item_id, "content_index": 0,
+                                         "sample_rate": self.out_rate,
+                                         "delta": base64.b64encode(
+                                             (np.clip(y24, -1, 1) * 32767).astype("<i2").tobytes()).decode()}
+                            self.send({"type": "response.audio.delta", **a_payload})
+                            # Open WebUI >= 0.13 renamed the reply events to OpenAI's newer output_audio
+                            # dialect; 0.7-era clients still expect response.audio.* — send both names.
+                            self.send({"type": "response.output_audio.delta", **a_payload})
                 except Exception as e:
                     log("realtime: talker error:", repr(e))
                     import server  # (lazy: server imports this module)
@@ -743,9 +746,11 @@ class RealtimeSession:
                             if filler:  # it went straight to a tool: say something meanwhile
                                 text += filler + " "
                                 text_parts.append(filler + " ")
-                                self.send({"type": "response.audio_transcript.delta",
-                                           "response_id": resp_id, "item_id": item_id,
-                                           "content_index": 0, "delta": filler + " "})
+                                t_payload = {"response_id": resp_id, "item_id": item_id,
+                                             "content_index": 0, "delta": filler + " "}
+                                self.send({"type": "response.audio_transcript.delta", **t_payload})
+                                self.send({"type": "response.output_audio_transcript.delta",
+                                           **t_payload})  # 0.13.x client name, same payload
                                 self.send({"type": "response.status", "response_id": resp_id,
                                            "status": "status.vad_grace_period"})  # typing indicator (OWUI 0.7)
                                 for piece in fr.push(filler):
@@ -753,8 +758,10 @@ class RealtimeSession:
                         continue
                     text += delta
                     text_parts.append(delta)
-                    self.send({"type": "response.audio_transcript.delta", "response_id": resp_id,
-                               "item_id": item_id, "content_index": 0, "delta": delta})
+                    t_payload = {"response_id": resp_id, "item_id": item_id, "content_index": 0, "delta": delta}
+                    self.send({"type": "response.audio_transcript.delta", **t_payload})
+                    self.send({"type": "response.output_audio_transcript.delta",
+                               **t_payload})  # 0.13.x client name, same payload
                     self.send({"type": "response.status", "response_id": resp_id,
                                "status": "status.vad_grace_period"})  # typing indicator (OWUI 0.7)
                     for piece in fr.push(delta):
@@ -774,8 +781,10 @@ class RealtimeSession:
         if cancel.is_set():
             return  # response.cancelled was already sent
         n_out = len(th.tok(full).input_ids) if full else 0
-        self.send({"type": "response.audio_transcript.done", "response_id": resp_id, "item_id": item_id,
-                   "content_index": 0, "transcript": full})
+        d_payload = {"response_id": resp_id, "item_id": item_id, "content_index": 0, "transcript": full}
+        self.send({"type": "response.audio_transcript.done", **d_payload})
+        self.send({"type": "response.output_audio_transcript.done",
+                   **d_payload})  # 0.13.x client name, same payload
         self.send({"type": "response.audio.done", "response_id": resp_id, "item_id": item_id,
                    "content_index": 0, "sample_rate": self.out_rate})
         self.send({"type": "response.status", "response_id": resp_id,
