@@ -32,6 +32,12 @@ DATA = Path(os.environ.get("MING_DATA_DIR") or HERE)
 _VERSION_FILE = HERE / "VERSION"
 VERSION = (os.environ.get("MING_VERSION")
            or (_VERSION_FILE.read_text().strip() if _VERSION_FILE.is_file() else "dev"))
+# MING_TZ (e.g. America/New_York): the timezone for logs, saved timestamps and spoken times.
+# The standard TZ variable wins if it is set; honored on POSIX hosts (Docker images set a default).
+if (tz := os.environ.get("MING_TZ")) and not os.environ.get("TZ"):
+    os.environ["TZ"] = tz
+    if hasattr(time, "tzset"):
+        time.tzset()
 
 import warnings
 

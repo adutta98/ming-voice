@@ -426,6 +426,12 @@ rewritten WebSocket base URL. `session.update` accepts `voice`, `instructions`, 
 `input_audio_buffer.commit`). Ming runs its own tools (web search, weather, Home Assistant, …) whenever
 they are configured; the reply is spoken with the selected voice.
 
+Clients whose realtime engine gates `response.create` on chat-save promises (Open WebUI 0.13 and later)
+can stall forever when a save hangs, and a committed turn is never answered — and neither is any later
+turn on the same connection, since each one waits on the last. If `response.create` does not arrive
+within `MING_RT_RESPOND_TIMEOUT` seconds (default 10, `0` disables it), Ming answers the turn on its
+own, and a late or retried request for that same turn is absorbed without a second reply.
+
 ## Settings and configuration
 
 <details>
@@ -454,6 +460,8 @@ they are configured; the reply is spoken with the selected voice.
 | `MING_API_KEY` | – | Require this key (`Authorization: Bearer …`) on every port, including localhost |
 | `MING_WYOMING_PORT` / `MING_WYOMING_ALLOW` | `10300` / private networks | The Home Assistant bridge's port, and who may connect (comma-separated addresses or networks) |
 | `MING_MODEL_DIR` | `./model` | Model folder |
+| `MING_TZ` | – (Docker: `America/New_York`) | Timezone for logs, saved timestamps, timers and spoken times (e.g. `America/New_York`). The standard `TZ` variable wins if it is set |
+| `MING_RT_RESPOND_TIMEOUT` | `10` | `/v1/realtime`: wait this many seconds for the client's `response.create` after a voice turn is committed, then answer the turn on our own (a stalled client, e.g. Open WebUI ≥ 0.13 with a hung chat save, would otherwise sit silent for the rest of the call). `0` disables it |
 | `MING_DATA_DIR` | the repo folder | Where cloned voices, lists, memory, timers, the saved conversation, settings files (`.ha_token`, `.brave_key`, …) and tuning caches are kept (`/data` in Docker) |
 | `MING_MAX_CTX` | `8192` (`16384` from 32 GB of VRAM, `4096` in int8 mode) | Conversation context in tokens. Costs VRAM (~60 MB per 1k tokens, plus larger graph buffers) but not speed: attention only reads the filled part. When it fills up, the context is rebuilt between turns (~0.5 s) from the conversation so far as text |
 | `MING_INT8_EXPERTS` | `auto` | Weight-only int8 for the MoE experts (`1`, `0`, or `auto` = int8 below 23 GB VRAM, or when the full model doesn't fit next to other programs). Identical greedy replies and transcripts on the test set, logit cosine ≥ 0.997 |

@@ -29,7 +29,7 @@ RUN set -eu; \
         sleep 5; \
     done; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        ca-certificates curl gcc libc6-dev openssl tini; \
+        ca-certificates curl gcc libc6-dev openssl tini tzdata; \
     rm -rf /var/lib/apt/lists/*
 COPY --from=ghcr.io/astral-sh/uv:0.11.14 /uv /usr/local/bin/uv
 WORKDIR /app
@@ -39,6 +39,7 @@ COPY setup_env.sh requirements.txt ./
 RUN --mount=type=cache,target=/root/.cache/uv MING_GPU=$GPU MING_SKIP_MODEL=1 bash setup_env.sh
 COPY . .
 ENV MING_GPU=$GPU MING_DATA_DIR=/data MING_MODEL_DIR=/data/model \
+    MING_TZ=America/New_York \
     MING_TURN_MODEL=/data/model_extra/smart-turn-v3.2-cpu.onnx \
     MING_VERSION=$MING_VERSION MING_GIT_REVISION=$MING_GIT_REVISION \
     HF_HOME=/data/cache/huggingface XDG_CACHE_HOME=/data/cache TRITON_CACHE_DIR=/data/cache/triton \

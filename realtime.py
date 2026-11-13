@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import queue
 import threading
 import time
@@ -42,6 +43,12 @@ FRAME = 512          # 32 ms @ 16 kHz (the Silero VAD window)
 IN_SR = 16000
 OUT_SR = 24000
 DEFAULT_MODEL = "ming-3.0-audio-tiny"
+
+# Open WebUI's (0.13 and later) realtime bridge gates `response.create` on a chain of chat-save
+# promises: if one hangs, every later turn on that connection hangs with it - the turn is
+# committed, we wait for `response.create`, silence. Answer it ourselves if it never arrives
+# within this grace period (0 disables the timer).
+RESPOND_TIMEOUT = float(os.environ.get("MING_RT_RESPOND_TIMEOUT", "10"))
 
 TURN_POOL = ThreadPoolExecutor(1)  # smart-turn scoring runs off the event loop
 
@@ -160,6 +167,8 @@ class RealtimeSession:
         self.commit_item = None  # item id issued on commit, for response.create metadata
         self.vad_item = None  # 0.3.8: item id pre-allocated at VAD start, named on the speech events
         self._swallowed: set[str] = set()  # committed turns with no reply (noise / stop); their response.create is absorbed
+        self._auto_answered: set[str] = set()  # 0.3.10: turns we answered ourselves (respond timeout); a late response.create for them is absorbed
+        self._respond_timer: asyncio.TimerHandle | None = None  # 0.3.10: answer a committed turn if the client never requests the reply
         self.out_rate = OUT_SR  # actual reply sample rate (OWUI accepts any rate)
 
     # ---------- transport ----------
@@ -218,6 +227,7 @@ class RealtimeSession:
 
     def close(self):
         self.close_evt.set()
+        self._cancel_respond_timer()
         if self.response is not None:
             self.response[2].set()
 
@@ -425,6 +435,8 @@ class RealtimeSession:
             self.send({"type": "conversation.item.input_audio_transcription.completed",
                        "item_id": item_id, "content_index": 0, "transcript": t})
             log(f"rt: sent transcription.completed for {item_id} - waiting for response.create")
+            if RESPOND_TIMEOUT > 0:  # a client that never asks for the reply (stuck save chain) gets answered anyway
+                self.loop.call_soon_threadsafe(self._arm_respond_timer, item_id)
 
     def _swallow_item(self, item_id: str, t: str):
         """A committed turn that gets no reply (noise or a stop command): show its transcript so the
@@ -443,6 +455,7 @@ class RealtimeSession:
         # input_audio_buffer.clear: drop buffered audio and abandon a committed-but-unanswered
         # turn (the client changes its mind; a response already running is the client's call
         # via response.cancel)
+        self._cancel_respond_timer()
         if self.server_vad:
             self._reset_listen()
             self.tail = np.zeros(0, dtype=np.float32)
@@ -489,6 +502,32 @@ class RealtimeSession:
                 self._begin_response(user_text=self.pending_text)
                 self.pending_text = ""
 
+    def _arm_respond_timer(self, item_id: str):
+        if self._respond_timer is not None:
+            self._respond_timer.cancel()
+        self._respond_timer = self.loop.call_later(RESPOND_TIMEOUT, self._on_respond_timeout, item_id)
+
+    def _cancel_respond_timer(self):
+        if self._respond_timer is not None:
+            self._respond_timer.cancel()
+            self._respond_timer = None
+
+    def _on_respond_timeout(self, item_id: str):
+        self._respond_timer = None
+        if item_id != self.commit_item or self.response is not None:
+            return  # the turn was cleared/superseded, or something is already being answered
+        audio, text = self.committed_audio, self.committed_text
+        self.commit_item, self.committed_audio, self.committed_text = None, None, ""
+        if len(self._auto_answered) > 256:
+            self._auto_answered.clear()
+        self._auto_answered.add(item_id)
+        log(f"rt: no response.create within {RESPOND_TIMEOUT:g} s - answering {item_id} on our own")
+        if audio is not None:
+            self._begin_response(audio=audio, input_item_id=item_id, heard=text or None)
+        else:
+            self._begin_response(user_text=text or (self.pending_text or None), input_item_id=item_id)
+        self.pending_text = ""
+
     def _on_response_create(self, msg: dict):
         user_text = None
         if isinstance(msg.get("item"), dict):
@@ -505,6 +544,12 @@ class RealtimeSession:
             f"match={item_id == self.commit_item} user_text={(user_text or '')[:40]!r}")
         if item_id in self._swallowed:
             log(f"rt: response.create for absorbed turn {item_id} - no reply")
+            self._absorb_response(item_id)
+            return
+        if item_id in self._auto_answered:
+            # the client finally asked (or retried) for a turn we already answered on its own:
+            # no second reply - finish its response slot so the client's state machine clears
+            log(f"rt: response.create for auto-answered turn {item_id} - absorbed")
             self._absorb_response(item_id)
             return
         audio = None
@@ -692,6 +737,7 @@ class RealtimeSession:
 
     def _begin_response(self, audio: np.ndarray | None = None, user_text: str | None = None,
                         input_item_id: str | None = None, heard: str | None = None):
+        self._cancel_respond_timer()  # whatever started this response, a late timer must not double-answer
         self.response = None  # close the previous slot before the new thread can race it
         cancel = threading.Event()
         resp_id, item_id = _oid("resp"), _oid("item")

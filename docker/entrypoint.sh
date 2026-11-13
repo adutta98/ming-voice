@@ -4,6 +4,9 @@
 set -euo pipefail
 cd /app
 . .venv/bin/activate
+# The container's timezone: logs, saved conversations, timers and spoken times all use it.
+# MING_TZ (the image's default: America/New_York); the standard TZ variable wins if it is set.
+export TZ="${TZ:-${MING_TZ:-America/New_York}}"
 mkdir -p "$MING_DATA_DIR"
 
 if [ "$MING_GPU" = nvidia ] && [ ! -e /dev/nvidiactl ]; then
