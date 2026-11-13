@@ -16,6 +16,7 @@ LABEL org.opencontainers.image.source=https://github.com/JMS1717/ming-voice \
       org.opencontainers.image.version=$MING_VERSION \
       org.opencontainers.image.revision=$MING_GIT_REVISION
 # gcc: Triton compiles a small launcher at the first GPU kernel. openssl: the phone-access certificate.
+# ffmpeg: decodes the audio containers soundfile can't read (m4a/aac) in /v1/audio/transcriptions.
 # tini: passes `docker stop` on to the server.
 # apt-get update exits 0 even when every source fails to fetch (e.g. transient DNS on the runner),
 # leaving apt install with no candidates and a confusing "no installation candidate" error; retry
@@ -29,7 +30,7 @@ RUN set -eu; \
         sleep 5; \
     done; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        ca-certificates curl gcc libc6-dev openssl tini tzdata; \
+        ca-certificates curl ffmpeg gcc libc6-dev openssl tini tzdata; \
     rm -rf /var/lib/apt/lists/*
 COPY --from=ghcr.io/astral-sh/uv:0.11.14 /uv /usr/local/bin/uv
 WORKDIR /app

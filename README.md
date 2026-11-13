@@ -366,7 +366,7 @@ The same server speaks the OpenAI API; interactive docs are at <http://localhost
 | Endpoint | |
 |---|---|
 | `POST /v1/audio/speech` | Text to speech: `{"input": "...", "voice": "US_Emma", "response_format": "wav"}` (wav, mp3, flac, pcm). wav and pcm stream as they're generated, first audio after ~0.12 s. OpenAI voice names (alloy, nova, …) map to built-in voices; cloned voices work by name |
-| `POST /v1/audio/transcriptions` | Speech to text (multipart `file`), any length, English or Chinese |
+| `POST /v1/audio/transcriptions` | Speech to text (multipart `file`), any length, English or Chinese; wav, flac, ogg, mp3 and m4a/aac (ffmpeg) |
 | `POST /v1/chat/completions` | Chat with text and/or audio input (`input_audio` parts) and optional spoken output (`"modalities": ["text", "audio"]`); `stream: true` streams text and pcm16 audio. Greedy decoding. OpenAI function calling isn't supported, but `"ming": {"tools": true}` lets the reply use Ming's own tools (and `"room": "Kitchen"` sets the Home Assistant area) |
 | `GET /v1/models` | `ming-3.0-audio-tiny` |
 | `WS /v1/realtime` | Direct voice conversation over the OpenAI Realtime protocol (see below) |

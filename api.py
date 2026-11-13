@@ -18,6 +18,9 @@ import asyncio
 import base64
 import io
 import json
+import os
+import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -147,12 +150,38 @@ async def _thread_stream(work, cancel: threading.Event):
 
 
 def _read_audio(data: bytes) -> np.ndarray:
-    """Any soundfile-readable audio -> 16 kHz mono float32."""
-    wav, sr = sf.read(io.BytesIO(data), dtype="float32", always_2d=True)
-    wav = torch.from_numpy(wav.mean(1))
-    if sr != 16000:
-        wav = torchaudio.functional.resample(wav, sr, 16000)
-    return wav.numpy()
+    """Any audio -> 16 kHz mono float32; soundfile first (wav, flac, ogg, mp3...), then an ffmpeg
+    fallback for the containers soundfile can't open (m4a/aac, the default iOS recording format)."""
+    try:
+        wav, sr = sf.read(io.BytesIO(data), dtype="float32", always_2d=True)
+        wav = torch.from_numpy(wav.mean(1))
+        if sr != 16000:
+            wav = torchaudio.functional.resample(wav, sr, 16000)
+        return wav.numpy()
+    except Exception as sf_err:
+        try:
+            return _decode_ffmpeg(data)
+        except Exception as ff_err:
+            raise ValueError(f"{sf_err} (ffmpeg fallback: {ff_err})") from ff_err
+
+
+def _decode_ffmpeg(data: bytes) -> np.ndarray:
+    """ffmpeg -> 16 kHz mono float32 (for the audio containers soundfile can't read).
+    The bytes go to a temp file rather than stdin: m4a/mp4 keep their index (moov atom) at the
+    end of the file, and ffmpeg can't seek into a pipe to find it - it would demux nothing
+    and exit 0."""
+    with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
+        f.write(data)
+        name = f.name
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", name, "-f", "f32le", "-ac", "1", "-ar", "16000", "pipe:1"],
+            capture_output=True, timeout=120)
+    finally:
+        os.unlink(name)
+    if proc.returncode != 0 or not proc.stdout:
+        raise ValueError((proc.stderr.decode("utf-8", "replace").strip() or "ffmpeg failed")[:500])
+    return np.frombuffer(proc.stdout, dtype=np.float32)
 
 
 # ------------------------------------------------------------------------------------------------ models
