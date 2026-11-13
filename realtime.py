@@ -93,6 +93,7 @@ class RealtimeSession:
         self.voice = E["voices"][0]
         self.modalities = ["audio", "text"]
         self.instructions = ""
+        self.chat_context = ""  # per-turn context (OWUI 0.7 updates it; others never do)
         self.max_out = 400
         self.temperature = 1.0
         self.server_vad = True  # turn_detection null (client VAD) -> turns only on explicit commit
