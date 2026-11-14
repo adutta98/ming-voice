@@ -9,6 +9,13 @@ server). Everything that arrives on the LAN port needs the access key, kept in `
   * API clients: `Authorization: Bearer <key>` (or `?key=`)
 The localhost port (8000) stays open without a key, as before. MING_API_KEY additionally requires a key
 on every port (then that value is the key).
+
+`MING_PROXY_AUTH`: if set, a request whose `X-Proxy-Auth` header matches that value is accepted without
+a key, on the ports that otherwise need one. Meant for the home reverse proxy (NPM + Authelia): it strips
+any client-sent copy of the header before forwarding, so only its traffic can carry it; direct
+connections that don't go through the proxy still need the key as before. Trusting the proxy also stops
+an auth-gated frontend from re-challenging on every request — the app answers the proxied request
+instead of 401, so the login flow terminates.
 """
 from __future__ import annotations
 
@@ -100,6 +107,13 @@ class AccessControl:
         key = access_key()
         given = _key_from(scope)
         ok = given is not None and hmac.compare_digest(given.encode(), key.encode())
+        if not ok:
+            # Trusted reverse proxy (see module doc): the proxy's own header passes, so a gated
+            # frontend (Authelia) is never answered 401 and the login loop can't happen.
+            trust = os.environ.get("MING_PROXY_AUTH")
+            if trust:
+                proxied = next((v for k, v in scope.get("headers", []) if k == b"x-proxy-auth"), b"")
+                ok = hmac.compare_digest(proxied, trust.encode())
         q = dict(parse_qsl(scope.get("query_string", b"").decode()))
         if ok and scope["type"] == "http" and "key" in q and scope["method"] == "GET" and not scope["path"].startswith("/v1"):
             # browser login: keep the key in a cookie and drop it from the address bar
