@@ -2,7 +2,11 @@
 
 WSL2 is only reachable from this PC, and browsers allow the microphone only on https://, so this listens on
 0.0.0.0:8443 with a self-signed certificate and forwards each connection to the server's LAN port
-(127.0.0.1:8001, which Windows forwards into WSL). The server checks the access key (see lan.py).
+(127.0.0.1:8001, which Windows forwards into WSL); the server checks the access key (see lan.py).
+The server only ever sees us as 127.0.0.1, so the head of each connection is rewritten with an
+`X-Forwarded-For` naming the real TCP peer (client-sent copies of that header, and of X-Real-IP, are
+dropped): we are the sole writer of the header, and lan.py's MING_PROXY_TRUSTED checks proxy headers
+against that value.
 
     python windows\\lan_proxy.py [--port 8443] [--target 127.0.0.1:8001]
 
@@ -137,6 +141,40 @@ async def main():
             writer.close()
             return
         nodelay(uw)
+        peer = writer.get_extra_info("peername") or ("unknown", 0)
+        ip = str(peer[0])
+        if ip.startswith("::ffff:"):
+            ip = ip.rsplit(":", 1)[0]
+        # Read the first request head, rewrite it with our TCP peer, and forward it plus the rest.
+        # Later keep-alive requests on the connection pass through unrewritten: the server remembers
+        # the connection's first source verdict per client (ip, port) (lan.py).
+        buf = b""
+        deadline = time.monotonic() + float(os.environ.get("MING_LAN_PROXY_HEAD_BUDGET", "60"))
+        try:
+            while b"\r\n\r\n" not in buf and time.monotonic() < deadline:
+                chunk = await asyncio.wait_for(reader.read(65536), 30)
+                if not chunk:
+                    break
+                buf += chunk
+                if len(buf) > 262144:
+                    break
+        except (asyncio.TimeoutError, ConnectionError, OSError, ssl.SSLError):
+            pass
+        end = buf.find(b"\r\n\r\n")
+        if buf and end != -1:
+            head = buf[:end]
+            kept = [line for line in head.split(b"\r\n")
+                    if line.split(b":", 1)[0].strip().lower() not in (b"x-forwarded-for", b"x-real-ip")]
+            # the original head's terminating blank line (\r\n\r\n) was dropped with buf[:end] and is
+            # rebuilt here after the appended header line: <kept lines>\r\n<new line>\r\n\r\n<body>
+            uw.write(b"\r\n".join(kept) + b"\r\nX-Forwarded-For: " + ip.encode() + b"\r\n\r\n" + buf[end + 4:])
+            await uw.drain()
+        elif buf:
+            # no complete head within the budget (oversized head or a stalled client): close both
+            # directions so raw bytes can never reach the server with a forged X-Forwarded-For
+            writer.close()
+            uw.close()
+            return
         await asyncio.gather(pipe(reader, uw), pipe(ur, writer))
 
     server = await asyncio.start_server(handle, "0.0.0.0", args.port, ssl=ctx, ssl_handshake_timeout=10)

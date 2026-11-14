@@ -11,15 +11,26 @@ The localhost port (8000) stays open without a key, as before. MING_API_KEY addi
 on every port (then that value is the key).
 
 `MING_PROXY_AUTH`: if set, a request whose `X-Proxy-Auth` header matches that value is accepted without
-a key, on the ports that otherwise need one. Meant for the home reverse proxy (NPM + Authelia): it strips
-any client-sent copy of the header before forwarding, so only its traffic can carry it; direct
-connections that don't go through the proxy still need the key as before. Trusting the proxy also stops
-an auth-gated frontend from re-challenging on every request — the app answers the proxied request
-instead of 401, so the login flow terminates.
+a key, on the ports that otherwise need one. Meant for the home reverse proxy (NPM + Authelia). The phone
+socket (8001) is normally served by `windows/lan_proxy.py`, a TLS-terminating byte pipe, so the server only
+ever sees it as 127.0.0.1: the proxy rewrites each connection's head with an `X-Forwarded-For` naming its
+real TCP peer (dropping client-sent copies of it and of X-Real-IP) and passes the rest, including the
+`X-Proxy-Auth` header, through unchanged. Trusting the proxy also stops an auth-gated frontend from
+re-challenging on every request — the app answers the proxied request instead of 401, so the login flow
+terminates.
+`MING_PROXY_TRUSTED` (comma-separated IPs and CIDRs): when set, the `X-Proxy-Auth` header is only honored
+if the request comes from one of those sources (the `X-Forwarded-For` peer on the phone socket, the direct
+TCP peer otherwise) - this is what stops other LAN machines from sending the header straight to the phone
+socket and bypassing the key. Unset: honored from any source (the 0.3.12 behavior). Requests without a
+valid header always still need the key, as before. The proxy stamps `X-Forwarded-For` on a connection's
+first request only: that request's source verdict (stamped XFF peer, or the direct TCP peer when no
+XFF) is remembered per client (ip, port) for a short while, and the connection's later keep-alive
+requests - which carry no header - inherit it.
 """
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import json
 import os
 import secrets
@@ -32,6 +43,40 @@ KEY_FILE = DATA / ".lan_key"
 INFO_FILE = DATA / ".lan_info.json"  # written by windows/lan_proxy.py: {"ips": [...], "port": 8443, "pid": ..}
 LAN_PORT = int(os.environ.get("MING_LAN_PORT", "8001"))
 COOKIE = "ming_key"
+_SOURCE_TTL = 300.0  # how long a per-source-port source verdict is kept (keep-alive connections)
+_SOURCE_MAX = 1024   # bound on remembered source ports (phones use a few; evict the oldest)
+
+
+def _trusted_sources() -> list | None:
+    """The networks MING_PROXY_TRUSTED allows the X-Proxy-Auth header from (None when unset: any source)."""
+    raw = os.environ.get("MING_PROXY_TRUSTED", "").strip()
+    if not raw:
+        return None
+    nets = []
+    for part in raw.split(","):
+        part = part.strip()
+        if part:
+            try:
+                nets.append(ipaddress.ip_network(part, strict=False))
+            except ValueError:
+                print(f"WARNING: ignoring unparseable MING_PROXY_TRUSTED entry: {part}")
+    return nets
+
+
+def _source_trusted(scope) -> bool:
+    """Whether this request's source (the X-Forwarded-For peer on the phone socket, the direct TCP peer
+    otherwise) is in MING_PROXY_TRUSTED; a missing or unparseable source is never trusted."""
+    peer = (scope.get("client") or (None, None))[0]
+    if peer in ("127.0.0.1", "::1"):
+        xff = next((v for k, v in scope.get("headers", []) if k == b"x-forwarded-for"), b"")
+        ip = xff.decode(errors="ignore").split(",")[0].strip()
+    else:
+        ip = peer or ""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in _trusted_sources() or [])
 
 
 def access_key() -> str:
@@ -94,6 +139,10 @@ class AccessControl:
 
     def __init__(self, app):
         self.app = app
+        # source port -> (verdict, expiry): a connection's first request is the only one carrying the
+        # proxy's X-Forwarded-For, so its source verdict also applies to the connection's later
+        # keep-alive requests (same source port, no header).
+        self._source_trust = {}
 
     def _needs_key(self, scope) -> bool:
         if os.environ.get("MING_API_KEY"):
@@ -113,7 +162,29 @@ class AccessControl:
             trust = os.environ.get("MING_PROXY_AUTH")
             if trust:
                 proxied = next((v for k, v in scope.get("headers", []) if k == b"x-proxy-auth"), b"")
-                ok = hmac.compare_digest(proxied, trust.encode())
+                if hmac.compare_digest(proxied, trust.encode()):
+                    # 0.3.13: the header only counts from trusted sources (0.3.12: from any source).
+                    # The proxy stamps X-Forwarded-For on a connection's first request only, so the
+                    # source verdict is fixed on that first request (stamped XFF peer, or the direct
+                    # TCP peer when no XFF) and remembered per client (ip, port). Later requests on
+                    # the connection no longer carry the header and inherit the unexpired verdict -
+                    # which also ignores a forged X-Forwarded-For a direct client might try to add on
+                    # a later request of the same connection. A fresh (ip, port) with an expired or
+                    # missing entry is decided on arrival.
+                    sources = _trusted_sources()
+                    if sources is None:
+                        ok = True
+                    else:
+                        key = scope.get("client") or (None, 0)
+                        now = time.monotonic()
+                        ent = self._source_trust.get(key)
+                        if ent is not None and ent[1] > now:
+                            ok = ent[0]
+                        else:
+                            ok = _source_trusted(scope)
+                            self._source_trust[key] = (ok, now + _SOURCE_TTL)
+                            if len(self._source_trust) > _SOURCE_MAX:
+                                self._source_trust.pop(next(iter(self._source_trust)))
         q = dict(parse_qsl(scope.get("query_string", b"").decode()))
         if ok and scope["type"] == "http" and "key" in q and scope["method"] == "GET" and not scope["path"].startswith("/v1"):
             # browser login: keep the key in a cookie and drop it from the address bar
