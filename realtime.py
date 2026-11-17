@@ -497,10 +497,16 @@ class RealtimeSession:
                 import server  # (lazy: server imports this module)
                 server.save_conversation(th)
         elif role == "user" and text:
-            self.pending_text = text
-            if self.server_vad and self.create_response and self.response is None:  # a typed turn, like a spoken one
-                self._begin_response(user_text=self.pending_text)
+            if text.lstrip().startswith("[Background only"):
+                # a status note injected by the Conduit app: the client marks it background-only and
+                # deliberately sends no response.create - never answer it aloud (it re-spoke the
+                # previous turn's answer verbatim, heard as an echo)
                 self.pending_text = ""
+            else:
+                self.pending_text = text
+                if self.server_vad and self.create_response and self.response is None:  # a typed turn, like a spoken one
+                    self._begin_response(user_text=self.pending_text)
+                    self.pending_text = ""
 
     def _arm_respond_timer(self, item_id: str):
         if self._respond_timer is not None:
