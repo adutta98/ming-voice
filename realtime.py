@@ -916,6 +916,11 @@ class RealtimeSession:
 
         full = "".join(text_parts)
         if cancel.is_set():
+            # release the slot here too (the completion path clears it below): while it held a
+            # cancelled response, deliver_notices kept deferring forever and a finished background
+            # result (hermes done, HA alert) was never spoken into the call.
+            if self.response is not None and self.response[0] == resp_id:
+                self.response = None
             return  # response.cancelled was already sent
         n_out = len(th.tok(full).input_ids) if full else 0
         d_payload = {"response_id": resp_id, "item_id": item_id, "content_index": 0, "transcript": full}
