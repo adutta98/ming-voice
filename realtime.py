@@ -231,6 +231,26 @@ class RealtimeSession:
         if self.response is not None:
             self.response[2].set()
 
+    def deliver_notices(self):
+        """Announce finished background tasks and alerts at the next quiet moment (event loop).
+        Same contract as the /ws Session's: the notice is spoken into the call, never as the user's turn."""
+        import server  # (lazy: server imports this module)
+        if not server.NOTICES or server.ACTIVE.get("sess") is not self:
+            return
+        if self.response is not None or self.close_evt.is_set():
+            self.loop.call_later(0.5, self.deliver_notices)
+            return
+        n = server.NOTICES.pop(0)
+        if n.get("expires") and time.time() > n["expires"]:
+            log(f"dropped a stale notification: {n['prompt'][:120]!r}")
+            if server.NOTICES:
+                self.loop.call_soon(self.deliver_notices)
+            return
+        # (chime/alarm UI events are a /ws protocol thing: in a realtime call the words below carry the news)
+        self._begin_response(user_text=n["prompt"])
+        if server.NOTICES:
+            self.loop.call_later(1.0, self.deliver_notices)
+
     # ---------- events in ----------
 
     def _send_conv_created(self):
@@ -988,6 +1008,7 @@ async def realtime(ws: WebSocket, model: str = ""):
     if old is not None and old is not sess:
         asyncio.ensure_future(_take_over(old))  # never awaited here: see _take_over
     ACTIVE["sess"] = sess
+    asyncio.get_running_loop().call_later(1.5, sess.deliver_notices)  # background results that finished while nobody was connected
     try:
         await sess.run()
     finally:

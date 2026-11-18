@@ -680,6 +680,9 @@ class Thinker:
         self.ar = torch.arange(self.max_ctx, device=DEVICE)
         self.tok_buf = torch.zeros(1, 1, dtype=torch.long, device=DEVICE)
         self.pos_buf = torch.zeros(1, dtype=torch.long, device=DEVICE)
+        # the logits of the last decode step (for the echo guard's masked argmax in _step)
+        self.step_logits = torch.zeros(1, self.model.lm_head.weight.shape[0], dtype=torch.float32, device=DEVICE)
+        self._echo_wordish: dict[int, bool] = {}  # token id -> decodes to a word char
 
     def _clear_state(self):
         for st in self._layers:
@@ -710,6 +713,7 @@ class Thinker:
     def _decode_step(self):
         h = self.model.model.word_embeddings(self.tok_buf)
         logits = self._forward(h, self.pos_buf)
+        self.step_logits.copy_(logits)  # (echo guard: _step can re-pick from these without another forward)
         self.tok_buf.copy_(logits.argmax(-1, keepdim=True))
         self.pos_buf.add_(1)
 
@@ -1000,8 +1004,9 @@ class Thinker:
         self.cur_len += T
         return int(logits[0].argmax())
 
-    def _step(self, tok):
-        """Feed `tok` at position cur_len and return the next greedy token."""
+    def _step(self, tok, ban=None):
+        """Feed `tok` at position cur_len and return the next greedy token.
+        ban: token ids the echo guard refuses — when greedy picks one, the next best wins."""
         self.tok_buf.fill_(tok)
         self.pos_buf.fill_(self.cur_len)
         L = next(b for b in self._buckets() if b > self.cur_len)
@@ -1010,8 +1015,32 @@ class Thinker:
         else:
             self.cache.attn_len = L
             self._decode_step()
+        if ban:
+            pick = int(self.tok_buf.item())
+            if pick in ban:
+                lg = self.step_logits[0]
+                lg[list(ban)] = torch.finfo(lg.dtype).min
+                self.tok_buf.copy_(lg.argmax(-1, keepdim=True))
+                log(f"echo guard: broke a greedy repeat of token {pick}")
         self.cur_len += 1
         return int(self.tok_buf.item())
+
+    def _wordish(self, tid: int) -> bool:
+        """Does this token decode to word characters (the echo guard only speaks up for those)?"""
+        v = self._echo_wordish.get(tid)
+        if v is None:
+            v = self.tok.decode([tid], skip_special_tokens=True).strip().isalnum()
+            self._echo_wordish[tid] = v
+        return v
+
+    def _echo_ban(self, gen: list[int]) -> set[int]:
+        """Greedy decoding (temperature 0) can lock onto doubling words in free-form answers
+        ('yourself yourself about about', doubled subwords 'ous ous'): refuse a token that repeats
+        the last one word-for-word (the attractor always doubles in place). The cost is one-time
+        legit doubles ('had had'), which reads as a stutter through the TTS anyway."""
+        if not gen or not self._wordish(gen[-1]):
+            return set()
+        return {gen[-1]}
 
     def render_history(self, turns: list[tuple[str, str]]) -> str:
         """Earlier (user, assistant) text exchanges in the chat format, e.g. from an API request."""
@@ -1173,7 +1202,7 @@ class Thinker:
                                     if not LONG_ASK.search(said()):
                                         log(f"long answer: ending it at {len(full.split())} words")
                                         break
-                    tok = self._step(tok)
+                    tok = self._step(tok, None if call else self._echo_ban(gen))
                 if retry and not cancel.is_set():
                     log(f"reply dodged its tool ({self.tok.decode(gen, skip_special_tokens=True)!r}): "
                         f"calling {retry} instead")
