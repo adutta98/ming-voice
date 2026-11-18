@@ -5,6 +5,8 @@ name: Docker images
 on:
   release:
     types: [published]
+  push:
+    tags: ['0.*']  # (fork: a tag push carries the same build as a release; a Contents-only token can push it)
   workflow_dispatch:
 
 jobs:
