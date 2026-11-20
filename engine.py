@@ -1135,8 +1135,23 @@ class Thinker:
         # end; if that claims no live data / search / weather, the reply starts over as that tool call instead.
         tool_names = {s.get("function", s).get("name") for s in self.tools.specs} if self.tools is not None else set()
         snap = self.snapshot() if tool_names & {"web_search", "home_assistant"} else None
+        # Deterministic Hermes routing: when the user's own words put "Hermes" next to a request verb,
+        # synthesize the ask_hermes call instead of leaving it to the thinker to sample (a heavy context
+        # of its own past answers makes the tiny model imitate itself and never delegate — 0.3.17).
+        from tools import hermes_request_for
+        hermes_task = (self.tools is not None and "ask_hermes" in tool_names
+                       and hermes_request_for(heard_text))
+        f_ids: list[int] = []
+        if hermes_task:
+            log(f"hermes gate: synthesizing ask_hermes({hermes_task[:60]!r}) from the transcript")
+            forced_call = ("<tool_call>ask_hermes\n<arg_key>task</arg_key>\n<arg_value>"
+                           + hermes_task + "\n</arg_value>")
+            f_ids = self.tok(forced_call, add_special_tokens=False).input_ids
+            ids = torch.cat([ids, torch.tensor([f_ids], device=DEVICE)], 1)
         tok = self._prefill(ids, feats)
         held, retry, forced, quiet = snap is not None, None, None, False
+        if f_ids:
+            forced = f_ids  # the round starts inside the synthesized call (as the dodged-tool retry does)
         gen: list[int] = []  # the spoken reply (text of every round, tool calls excluded)
         emitted = ""
         seen, used_tools, ended = set(), False, False

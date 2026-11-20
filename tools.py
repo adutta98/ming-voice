@@ -937,6 +937,31 @@ def in_character(say: str, persona: str, n: int = 0) -> str:
     return f"{BUTLER_OPENERS[n % len(BUTLER_OPENERS)]} {rest[:1].upper()}{rest[1:]}"
 HERMES_NAME_RE = re.compile(r"\b(h[eu]rm[eèéi]|erm[eè]s)", re.I)  # (and how ASR writes it: Hermès, Hermies, ...)
 
+# Deterministic Hermes routing (0.3.17): the tiny thinker sometimes stops emitting the
+# ask_hermes call once the context is heavy with its own past answers (it imitates itself
+# instead of delegating). The transcript is reliable, so when the user's own words name
+# Hermes next to a request verb, the engine synthesizes the call instead of sampling it.
+HERMES_ASK_NAME = r"\bh[eu]rm(?:es|e[sz]|ès|és|ie[sz]?|é)\b"
+HERMES_ASK_RE = re.compile(r"\b(ask|tell|get|have|show|remind|want|would\s+like|need)\b[^.?;!,]{0,24}"
+                           + HERMES_ASK_NAME + r"[^.?;!,]{0,6}", re.I)
+HERMES_ASK_LEAD_RE = re.compile(r"^\s*(?:(?:and|also|please|hey|ok|okay|so|well)[,.]?\s+)*"
+                                r"(?:can|could|would|will)?\s*(?:you|I|we)?\s*"
+                                r"ask\s+" + HERMES_ASK_NAME + r"\s*(?:to(?=\s)|for|about)?\s*",
+                                re.I)
+
+
+def hermes_request_for(text: str) -> str | None:
+    """The task the user asked Hermes to do, or None if this turn isn't a Hermes request.
+    Rails: the name must sit next to a request verb; short/garbled transcripts fall through
+    to normal model routing."""
+    text = (text or "").strip()
+    if len(text.split()) < 3 or not HERMES_NAME_RE.search(text) or not HERMES_ASK_RE.search(text):
+        return None
+    task = HERMES_ASK_LEAD_RE.sub("", text, count=1).strip()
+    if len(task.split()) < 2:  # barely more than "ask hermes": nothing to hand over
+        return None
+    return (task[:1].lower() + task[1:])[:600]
+
 
 def hermes_auto() -> bool:
     return os.environ.get("MING_HERMES_AUTO", "0") == "1"
